@@ -1,0 +1,7 @@
+name: mcp-memory
+version: 1.0.0
+description: "A memory provider plugin for Hermes Agent backed by a self-hosted mcp-memory-service instance."
+pip_dependencies:
+  - httpx
+requires_env: []
+hooks: []
