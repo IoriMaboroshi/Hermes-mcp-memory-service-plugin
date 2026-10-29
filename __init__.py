@@ -9,6 +9,7 @@ import threading
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 from agent.memory_provider import MemoryProvider, spawn_context_thread
 
@@ -23,6 +24,7 @@ else:
 
 logger = logging.getLogger(__name__)
 
+_BASE_URL = ""  # 必须由 config.json 的 base_url 或环境变量 MCP_MEMORY_URL 提供
 _REQUEST_TIMEOUT = 3.0
 _PREFETCH_RESULTS = 5
 _MAX_PREFETCH_CHARS = 300
@@ -31,7 +33,25 @@ _COMPRESS_MESSAGE_LIMIT = 30
 _MESSAGE_CHAR_LIMIT = 2_000
 _SESSION_CHAR_LIMIT = 12_000
 _COMPRESS_CHAR_LIMIT = 16_000
+_SESSION_TOKEN_BUDGET = 30_000
+_LLM_TIMEOUT = 15.0
+_MCP_TIMEOUT = 20.0
 _RELATIVE_SCORE_FLOOR = 0.95
+_SESSION_EXTRACTION_SYSTEM_PROMPT = """You extract structured learnings from an agent session transcript.
+
+Output ONLY a JSON object with these keys:
+- task_summary: 1-2 sentences, what this session was about (write in Chinese)
+- outcome: one of "success", "partial", "failure" (these exact three words)
+- decisions: array of {"what": str, "why": str} — decisions made and their reasons. Write in Chinese.
+- errors: array of {"error": str, "tool": str, "resolution": str} — what went wrong, which tool/command was involved, how it was resolved. Write in Chinese.
+- user_corrections: array of {"original": str, "corrected_to": str} — original was what the agent assumed/did, corrected_to is what the user actually wanted. Write in Chinese.
+
+Rules:
+- Be specific and self-contained. Never write "today", "just now", "this PR", "刚才", "今天".
+- Skip greetings, acknowledgements, trivial back-and-forth.
+- Empty category → empty array.
+- Always include the WHY for decisions; the reason is more valuable than the decision.
+"""
 _TRIVIAL_TOKENS = {
     "测试",
     "看看",
@@ -88,6 +108,8 @@ def _candidate_config_paths(
                 / "mcp-memory"
                 / "config.json"
             )
+    candidates.append(Path.home() / ".hermes" / "plugins" / "mcp-memory" / "config.json")
+
     unique: list[Path] = []
     seen: set[Path] = set()
     for path in candidates:
@@ -109,6 +131,7 @@ class McpMemoryProvider(MemoryProvider):
         self._session_id = ""
         self._platform = ""
         self._should_write = True
+        self._config: dict[str, Any] = self._load_config()
 
     @property
     def name(self) -> str:
@@ -117,19 +140,12 @@ class McpMemoryProvider(MemoryProvider):
     def is_available(self) -> bool:
         if httpx is None:
             return False
-        return bool(self._resolve_base_url() and self._resolve_token())
+        return bool(self._resolve_token())
 
     def unavailable_reason(self) -> str:
         if httpx is None:
             detail = f": {_HTTPX_IMPORT_ERROR}" if _HTTPX_IMPORT_ERROR else ""
             return f"mcp-memory requires the httpx package{detail}"
-        if not self._resolve_base_url():
-            candidates = ", ".join(str(path) for path in self._config_candidates())
-            return (
-                "mcp-memory is not configured: base_url is missing. Set "
-                "MCP_MEMORY_URL or add a 'base_url' field to one of: "
-                f"{candidates}"
-            )
         if not self._resolve_token():
             candidates = ", ".join(str(path) for path in self._config_candidates())
             return (
@@ -141,6 +157,7 @@ class McpMemoryProvider(MemoryProvider):
     def initialize(self, session_id: str, **kwargs: Any) -> None:
         self._session_id = str(session_id or "")
         self._hermes_home = kwargs.get("hermes_home")
+        self._config = self._load_config()
         self._platform = str(kwargs.get("platform") or "")
         context = str(kwargs.get("agent_context") or "primary").strip().lower()
         self._should_write = context == "primary"
@@ -289,20 +306,377 @@ class McpMemoryProvider(MemoryProvider):
         if not self._should_write:
             return
         try:
-            content = self._format_messages(
-                messages,
-                limit=_SESSION_MESSAGE_LIMIT,
-                max_chars=_SESSION_CHAR_LIMIT,
+            user_count = sum(
+                1
+                for message in messages
+                if isinstance(message, dict)
+                and str(message.get("role") or "").strip().lower() == "user"
             )
-            if not content:
+            if user_count < 2:
                 return
-            self._store_memory(
-                content,
-                ["hermes", f"session-{self._today()}"],
-                "note",
+            if not self._has_tool_trace(messages) and user_count < 4:
+                return
+
+            collected = self._collect_session_messages(messages)
+            if not collected:
+                return
+
+            try:
+                insights = self._extract_session_insights(collected)
+            except Exception as exc:
+                logger.warning("mcp-memory LLM extraction failed: %s", exc)
+                insights = None
+            if insights:
+                try:
+                    self._commit_session(insights)
+                except Exception as exc:
+                    logger.warning("mcp-memory session commit failed: %s", exc)
+
+            lines: list[str] = []
+            if self._session_id:
+                lines.append(f"Session: {self._session_id}")
+            lines.extend(
+                f"{message['role']}: {message['content']}" for message in collected
             )
+            tags = ["hermes", f"session-{self._today()}"]
+            if insights is None:
+                tags.append("no-llm-extract")
+            self._store_memory("\n".join(lines), tags, "note")
         except Exception:
             logger.warning("mcp-memory session-end save failed", exc_info=True)
+
+    @staticmethod
+    def _has_tool_trace(messages: list[dict[str, Any]]) -> bool:
+        for message in messages:
+            if not isinstance(message, dict):
+                continue
+            role = str(message.get("role") or "").strip().lower()
+            if role in {"tool", "function"}:
+                return True
+            if message.get("tool_calls") or message.get("function_call"):
+                return True
+            if message.get("tool_call_id"):
+                return True
+            content = message.get("content")
+            if isinstance(content, list):
+                for item in content:
+                    if not isinstance(item, dict):
+                        continue
+                    item_type = str(item.get("type") or "").strip().lower()
+                    if item_type in {
+                        "tool_call",
+                        "tool_use",
+                        "tool_result",
+                        "function_call",
+                        "function_result",
+                    }:
+                        return True
+        return False
+
+    def _collect_session_messages(
+        self, messages: list[dict[str, Any]]
+    ) -> list[dict[str, Any]]:
+        if not isinstance(messages, list):
+            return []
+
+        collected: list[dict[str, Any]] = []
+        estimated_tokens = 0
+        for message in reversed(messages):
+            if not isinstance(message, dict):
+                continue
+            role = str(message.get("role") or "").strip().lower()
+            if role == "system":
+                continue
+            text = self._content_text(message.get("content"))
+            if not text:
+                continue
+            if role == "assistant" and len(text) > 1_000:
+                text = text[:800] + "…" + text[-200:]
+            elif role in {"tool", "function"} and len(text) > 300:
+                text = text[:300] + "…"
+            elif role != "user" and len(text) > 500:
+                text = text[:500]
+
+            tokens = len(text) // 2
+            if estimated_tokens + tokens > _SESSION_TOKEN_BUDGET:
+                break
+            collected.append({"role": role, "content": text})
+            estimated_tokens += tokens
+            if estimated_tokens >= _SESSION_TOKEN_BUDGET:
+                break
+
+        collected.reverse()
+        return collected
+
+    def _extract_session_insights(
+        self, collected: list[dict[str, Any]]
+    ) -> dict[str, Any] | None:
+        if httpx is None or not collected:
+            return None
+        config = self._config
+        api_key = str(config.get("llm_api_key") or "").strip()
+        base_url = str(config.get("llm_base_url") or "").strip().rstrip("/")
+        model = str(config.get("llm_model") or "").strip()
+        if not api_key or not base_url or not model:
+            return None
+
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        }
+        if "opencode.ai" in base_url.lower():
+            headers["x-opencode-session"] = self._session_id or str(uuid4())
+
+        transcript = "\n\n".join(
+            f"{message['role']}: {message['content']}" for message in collected
+        )
+        payload = {
+            "model": model,
+            "messages": [
+                {"role": "system", "content": _SESSION_EXTRACTION_SYSTEM_PROMPT},
+                {
+                    "role": "user",
+                    "content": f"Session transcript:\n\n{transcript}",
+                },
+            ],
+            "temperature": 0.1,
+            "max_tokens": 1500,
+        }
+        try:
+            with httpx.Client(timeout=_LLM_TIMEOUT) as client:
+                response = client.post(
+                    f"{base_url}/chat/completions",
+                    headers=headers,
+                    json=payload,
+                )
+                response.raise_for_status()
+                text = response.text
+        except Exception as exc:
+            logger.warning("mcp-memory LLM extraction failed: %s", exc)
+            return None
+
+        data = self._parse_json_object(self._extract_llm_output(text))
+        if not isinstance(data, dict):
+            return None
+        task_summary = data.get("task_summary")
+        if not isinstance(task_summary, str) or not task_summary.strip():
+            return None
+        # LLM 经常忽略枚举约束返回描述句，统一归一化而不是丢弃整条结果
+        outcome = self._normalize_outcome(data.get("outcome"))
+
+        decisions = data.get("decisions")
+        errors = data.get("errors")
+        corrections = data.get("user_corrections")
+        return {
+            "task_summary": task_summary.strip(),
+            "outcome": outcome,
+            "decisions": decisions if isinstance(decisions, list) else [],
+            "errors": errors if isinstance(errors, list) else [],
+            "user_corrections": corrections if isinstance(corrections, list) else [],
+        }
+
+    @staticmethod
+    def _extract_llm_output(text: str) -> str:
+        raw = str(text or "").strip()
+        try:
+            envelope = json.loads(raw)
+        except (TypeError, ValueError):
+            return raw
+        if not isinstance(envelope, dict):
+            return raw
+        choices = envelope.get("choices")
+        if not isinstance(choices, list) or not choices:
+            return raw
+        first = choices[0]
+        if not isinstance(first, dict):
+            return raw
+        message = first.get("message")
+        if not isinstance(message, dict):
+            return raw
+        content = message.get("content")
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            parts: list[str] = []
+            for item in content:
+                if isinstance(item, dict) and item.get("text") is not None:
+                    parts.append(str(item["text"]))
+            if parts:
+                return "\n".join(parts)
+        return raw
+
+    @staticmethod
+    def _parse_json_object(text: str) -> dict[str, Any] | None:
+        candidates: list[str] = [str(text or "").strip()]
+        current = candidates[0]
+        if "```json" in current.lower():
+            start = current.lower().find("```json") + len("```json")
+            end = current.find("```", start)
+            if end != -1:
+                candidates.append(current[start:end].strip())
+        first_brace = current.find("{")
+        last_brace = current.rfind("}")
+        if first_brace != -1 and last_brace > first_brace:
+            candidates.append(current[first_brace : last_brace + 1])
+
+        for candidate in candidates:
+            if not candidate:
+                continue
+            try:
+                data = json.loads(candidate)
+            except (TypeError, ValueError):
+                continue
+            if isinstance(data, dict):
+                return data
+        return None
+
+    def _commit_session(self, insights: dict[str, Any]) -> bool:
+        if httpx is None:
+            return False
+        token = self._resolve_token()
+        if not token:
+            return False
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+            "Accept": "application/json, text/event-stream",
+        }
+        insights = self._normalize_insights(insights)
+        arguments = {
+            "session_id": self._session_id or "hermes-unknown",
+            "agent_id": "hermes",
+            "task_summary": str(insights.get("task_summary") or ""),
+            "outcome": self._normalize_outcome(insights.get("outcome")),
+            "decisions": self._coerce_objects(insights.get("decisions"), "decision"),
+            "errors": self._coerce_objects(insights.get("errors"), "error"),
+            "user_corrections": self._coerce_objects(
+                insights.get("user_corrections"), "correction"
+            ),
+        }
+        payload = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {"name": "commit_session_legacy", "arguments": arguments},
+        }
+        try:
+            with httpx.Client(timeout=_MCP_TIMEOUT) as client:
+                response = client.post(
+                    f"{self._base_url().rstrip('/')}/mcp",
+                    headers=headers,
+                    json=payload,
+                )
+                response.raise_for_status()
+                return self._mcp_response_ok(response.text)
+        except Exception as exc:
+            logger.warning("mcp-memory commit_session_legacy failed: %s", exc)
+            return False
+
+    @staticmethod
+    def _normalize_insights(insights: dict[str, Any]) -> dict[str, Any]:
+        """把 LLM 可能的字段变体对齐到服务端 schema。
+
+        服务端实际读取的字段（server_impl.py:2452-2480）：
+          errors:           {error, tool, resolution}
+          user_corrections: {original, corrected_to}
+          decisions:        {what, why}
+        """
+        if not isinstance(insights, dict):
+            return {}
+        result = dict(insights)
+
+        errors: list[dict[str, str]] = []
+        for item in insights.get("errors") or []:
+            if isinstance(item, dict):
+                errors.append(
+                    {
+                        "error": str(item.get("error") or item.get("problem") or "").strip(),
+                        "tool": str(item.get("tool") or item.get("context") or "").strip(),
+                        "resolution": str(
+                            item.get("resolution")
+                            or item.get("fix")
+                            or item.get("root_cause")
+                            or ""
+                        ).strip(),
+                    }
+                )
+            elif item:
+                errors.append({"error": str(item).strip(), "tool": "", "resolution": ""})
+        result["errors"] = [e for e in errors if e["error"]]
+
+        corrections: list[dict[str, str]] = []
+        for item in insights.get("user_corrections") or []:
+            if isinstance(item, dict):
+                corrected = str(
+                    item.get("corrected_to") or item.get("correct") or item.get("correction") or ""
+                ).strip()
+                original = str(item.get("original") or item.get("wrong") or "").strip()
+                if corrected or original:
+                    corrections.append({"original": original, "corrected_to": corrected})
+            elif item:
+                corrections.append({"original": "", "corrected_to": str(item).strip()})
+        result["user_corrections"] = corrections
+
+        return result
+
+    @staticmethod
+    def _coerce_objects(value: Any, key: str) -> list[dict[str, Any]]:
+        """commit_session_legacy 要求 decisions/errors/user_corrections 都是 object 数组。"""
+        if not isinstance(value, list):
+            return []
+        result: list[dict[str, Any]] = []
+        for item in value:
+            if isinstance(item, dict):
+                result.append(item)
+            elif item is not None and str(item).strip():
+                result.append({key: str(item).strip()})
+        return result
+
+    @staticmethod
+    def _normalize_outcome(value: Any) -> str:
+        """服务端只接受 success / partial / failure，LLM 常给 completed / failed。"""
+        raw = str(value or "").strip().lower()
+        mapping = {
+            "completed": "success",
+            "complete": "success",
+            "done": "success",
+            "ok": "success",
+            "failed": "failure",
+            "fail": "failure",
+            "error": "failure",
+        }
+        normalized = mapping.get(raw, raw)
+        return normalized if normalized in {"success", "partial", "failure"} else "success"
+
+    @staticmethod
+    def _mcp_response_ok(text: str) -> bool:
+        raw = str(text or "").strip()
+        if not raw:
+            return False
+        candidates = [
+            line[len("data:") :].strip()
+            for line in raw.splitlines()
+            if line.startswith("data:")
+            and line[len("data:") :].strip() not in {"", "[DONE]"}
+        ]
+        if not candidates:
+            candidates.append(raw)
+
+        for candidate in candidates:
+            try:
+                data = json.loads(candidate)
+            except (TypeError, ValueError):
+                continue
+            if not isinstance(data, dict):
+                continue
+            if data.get("error"):
+                return False
+            result = data.get("result")
+            if isinstance(result, dict) and result.get("isError") is True:
+                return False
+            if "result" in data:
+                return True
+        return False
 
     def on_pre_compress(self, messages: list[dict[str, Any]]) -> str:
         if not self._should_write:
@@ -330,53 +704,58 @@ class McpMemoryProvider(MemoryProvider):
             self._pending_prefetch.clear()
             self._prefetch_generation.clear()
 
-    def _resolve_base_url(self) -> str:
-        base_url = os.environ.get("MCP_MEMORY_URL", "").strip()
-        if base_url:
-            return base_url.rstrip("/")
-        for path in self._config_candidates():
-            base_url = self._read_config_value(path, "base_url")
-            if base_url:
-                return base_url.rstrip("/")
-        return ""
-
     def _resolve_token(self) -> str:
         token = os.environ.get("MCP_MEMORY_TOKEN", "").strip()
         if token:
             return token
         for path in self._config_candidates():
-            token = self._read_config_value(path, "token")
+            token = self._read_config_token(path)
             if token:
                 return token
         return ""
 
+    def _base_url(self) -> str:
+        configured = str(self._config.get("base_url") or "").strip()
+        return configured or _BASE_URL
+
+    def _load_config(self) -> dict[str, Any]:
+        config: dict[str, Any] = {}
+        for path in self._config_candidates():
+            data = self._read_config_data(path)
+            if not data:
+                continue
+            for key, value in data.items():
+                config.setdefault(key, value)
+        return config
+
     def _config_candidates(self) -> list[Path]:
         return _candidate_config_paths(self._hermes_home)
 
-    def _read_config_value(self, path: Path, field: str) -> str:
+    def _read_config_token(self, path: Path) -> str:
+        data = self._read_config_data(path)
+        return str(data.get("token") or "").strip()
+
+    def _read_config_data(self, path: Path) -> dict[str, Any]:
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
         except FileNotFoundError:
-            return ""
+            return {}
         except Exception as exc:
             logger.warning("mcp-memory could not read config %s: %s", path, exc)
-            return ""
+            return {}
         if not isinstance(data, dict):
-            return ""
-        return str(data.get(field) or "").strip()
+            return {}
+        return data
 
     def _request_json(self, method: str, path: str, payload: dict[str, Any] | None = None) -> Any:
         if httpx is None:
             logger.warning("mcp-memory request skipped because httpx is unavailable")
             return None
         try:
-            base_url = self._resolve_base_url()
-            if not base_url:
-                raise RuntimeError("mcp-memory base_url is not configured")
             token = self._resolve_token()
             if not token:
                 raise RuntimeError("mcp-memory token is not configured")
-            url = f"{base_url}/{path.lstrip('/')}"
+            url = f"{self._base_url().rstrip('/')}/{path.lstrip('/')}"
             headers = {"X-API-Key": token, "Accept": "application/json"}
             with httpx.Client(timeout=_REQUEST_TIMEOUT) as client:
                 response = client.request(method, url, headers=headers, json=payload)

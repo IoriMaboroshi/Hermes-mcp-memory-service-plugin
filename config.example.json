@@ -1,4 +1,7 @@
 {
-  "base_url": "http://localhost:8765",
-  "token": "your-api-key-here"
+  "token": "your-mcp-memory-token",
+  "base_url": "http://127.0.0.1:8000",
+  "llm_api_key": "optional-llm-key",
+  "llm_base_url": "https://api.openai.com/v1",
+  "llm_model": "gpt-4o-mini"
 }

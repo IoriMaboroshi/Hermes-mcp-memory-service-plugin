@@ -1,136 +1,133 @@
-# Hermes Memory MCP
+# Hermes mcp-memory-service Provider
 
-A memory provider plugin for Hermes Agent. It connects the agent's long-term memory interface to a
-self-hosted [mcp-memory-service](https://github.com/doobidoo/mcp-memory-service) instance running in
-REST API mode.
+A [Hermes Agent](https://hermes-agent.nousresearch.com) memory provider plugin that connects to a self-hosted [mcp-memory-service](https://github.com/doobidoo/mcp-memory-service) server.
+
+在 `prefetch` 环节将相关长期记忆注入上下文，在会话结束时用 LLM 把对话提炼成结构化字段（决策 / 错误 / 用户纠正）写回记忆库。
 
 ## What it does
 
-Hermes supports pluggable memory providers. This plugin implements that interface so an agent can:
-
-- recall relevant long-term memories automatically before a turn;
-- expose explicit `memory_search` and `memory_store` tools to the agent;
-- archive the end of each session; and
-- save a checkpoint before conversation compression discards context.
-
-The plugin is deliberately small: it translates Hermes memory lifecycle hooks into requests against
-the mcp-memory-service REST API and keeps no local memory database of its own.
-
-## Requirements
-
-- Hermes Agent with external memory provider support.
-- Python 3.10 or newer.
-- The `httpx` package. Hermes installs plugin dependencies declared in `plugin.yaml`.
-- A running mcp-memory-service instance with its REST API enabled and an API key configured.
+| Hook | Behavior |
+|---|---|
+| `prefetch(query)` | 每轮对话前语义检索，注入相关的历史记忆（带相对分数过滤，避免噪声） |
+| `queue_prefetch` | 后台线程预取，不阻塞主线程 |
+| `on_session_end(messages)` | 按 30K token 预算收集会话 → LLM 提炼 → `commit_session_legacy` → 另存原文兜底 |
+| `on_pre_compress(messages)` | 压缩前抢救对话快照 |
+| `memory_search` / `memory_store` | 暴露给 agent 的两个工具 |
 
 ## Installation
 
 ```bash
-git clone <repo> ~/.hermes/plugins/mcp-memory
-cp ~/.hermes/plugins/mcp-memory/config.example.json ~/.hermes/plugins/mcp-memory/config.json
-# Edit config.json and fill in base_url and token.
+# 1. 放进 Hermes 的 plugins 目录
+cp -r mcp-memory ~/.hermes/plugins/mcp-memory
+
+# 2. 写配置
+cp config.example.json ~/.hermes/plugins/mcp-memory/config.json
+# 编辑填 base_url / token
+
+# 3. 启用
+hermes plugins enable mcp-memory
 hermes config set memory.provider mcp-memory
-hermes config set plugins.enabled '["mcp-memory"]'
-# Restart the Hermes gateway.
+
+# 4. 重启
 ```
 
-`config.json` contains credentials and is ignored by Git. Never commit it.
+验证：
+
+```bash
+hermes memory status
+# Provider:  mcp-memory
+# Plugin:    installed ✓
+# Status:    available ✓
+```
 
 ## Configuration
 
-The plugin accepts configuration from environment variables or `config.json`. Environment variables
-take precedence.
-
-| Setting | Environment variable | `config.json` field | Description |
-| --- | --- | --- | --- |
-| Base URL | `MCP_MEMORY_URL` | `base_url` | URL of the mcp-memory-service REST API, without a trailing slash requirement. |
-| API key | `MCP_MEMORY_TOKEN` | `token` | API key sent in the `X-API-Key` header. |
-
-Example `config.json`:
+`config.json`（查找顺序：环境变量 → `$HERMES_HOME/plugins/mcp-memory/` → `~/.hermes/plugins/mcp-memory/` → `~/.config/mcp-memory/`）
 
 ```json
 {
-  "base_url": "http://localhost:8765",
-  "token": "your-api-key-here"
+  "token": "your-mcp-memory-token",
+  "base_url": "http://127.0.0.1:8000",
+
+  "llm_api_key": "optional",
+  "llm_base_url": "https://api.openai.com/v1",
+  "llm_model": "gpt-4o-mini"
 }
 ```
 
-Configuration files are checked at these locations:
+- `token` — mcp-memory-service 的 API key，必填
+- `base_url` — 服务地址，必填（不带尾部斜杠）
+- `llm_*` — 可选。不填则跳过 LLM 提炼，只存原文，`tags` 里会带 `no-llm-extract`
 
-1. `<hermes_home>/plugins/mcp-memory/config.json` when Hermes supplies `hermes_home`;
-2. `$HERMES_HOME/.hermes/plugins/mcp-memory/config.json`; and
-3. `$HOME/.hermes/plugins/mcp-memory/config.json`.
+也可以用环境变量 `MCP_MEMORY_URL` / `MCP_MEMORY_TOKEN` 覆盖。
 
-The plugin is available only when `httpx` is installed, a base URL is configured, and a token is
-configured. If the base URL is missing, `unavailable_reason()` reports that `base_url` is not
-configured.
+**支持 OpenAI 兼容的任何端点。** 如果 `llm_base_url` 包含 `opencode.ai`，插件会自动附加 `x-opencode-session` 头。
 
-## Implemented hooks
+## How session collection works
 
-| Hook | Behavior |
-| --- | --- |
-| `is_available` | Checks for `httpx`, a base URL, and a token before initialization. |
-| `initialize` | Records the session, Hermes home, platform, and whether this agent should write memories. |
-| `system_prompt_block` | Tells the agent when to search memory and when to store durable facts. |
-| `prefetch` | Returns relevant memory for the current query, consuming any queued background result. |
-| `queue_prefetch` | Searches memory in a background thread for use on the next turn. |
-| `get_tool_schemas` | Publishes the `memory_search` and `memory_store` tool schemas. |
-| `handle_tool_call` | Executes memory search and store requests and returns JSON results. |
-| `on_session_end` | Archives a bounded transcript when a session ends. |
-| `on_pre_compress` | Saves a bounded checkpoint before context compression. |
-| `shutdown` | Clears queued prefetch state and pending generations. |
+不是"取最后 20 条消息"这种粗暴截断。旧版就是这么干的，长会话的决策链全部丢失。
 
-Only the primary agent context writes memories. Delegated contexts can still use configured tools,
-but session-end and compression hooks avoid duplicating archived transcripts.
+现在的规则：
 
-## Tools
+```
+从最后一条往前收集，直到累计估算 token 达到 30,000
+token 估算 = len(text) // 2
 
-| Tool | Purpose | Key arguments |
-| --- | --- | --- |
-| `memory_search` | Search long-term memory for relevant prior context. | `query`, optional `n_results` from 1 to 20 |
-| `memory_store` | Store a durable fact, preference, decision, or conclusion. | `content`, optional `tags`, optional `memory_type` |
+按角色分层截断：
+  user       → 全文保留（这是意图，最重要）
+  assistant  → 超 1000 字 → 前 800 + "…" + 后 200
+  tool       → 超 300 字  → 前 300 + "…"
+  system     → 跳过
+  其他       → 超 500 字  → 截断
+```
 
-Both tools return JSON. Search results include the service's stored memory fields and normalized
-similarity scores when available.
+入口过滤：`user` 消息少于 2 条直接跳过（闲聊不入库）。
 
-## Design notes
+## What gets extracted
 
-### Configuration before initialization
+LLM 返回的结构化 JSON：
 
-Hermes asks whether a provider is available before calling `initialize()`. Configuration resolution
-therefore cannot depend on initialized instance state. The plugin resolves environment variables and
-probes the standard Hermes config locations on demand, including from `is_available()` and
-`unavailable_reason()`.
+```json
+{
+  "task_summary": "把 embedding 模型换成 bge-m3，先备份、删库重建",
+  "outcome": "success",
+  "decisions": [
+    {"what": "改动前先 cp -a 全量备份", "why": "换模型失败时能完整回滚"}
+  ],
+  "errors": [
+    {"error": "批量导入返回 400", "tool": "embedding API", "resolution": "截断到 6000 字符"}
+  ],
+  "user_corrections": [
+    {"original": "用本地模型", "corrected_to": "用云端 API，不装 torch"}
+  ]
+}
+```
 
-### Relative score filtering
+这套字段名是 mcp-memory-service `commit_session_legacy` 实际读取的 schema（`server_impl.py`），改了就对不上，服务端会静默存空字符串。
 
-This plugin uses a relative cutoff rather than a fixed similarity threshold. The
-`all-MiniLM-L6-v2` embedding model commonly produces cosine similarities compressed into the roughly
-0.65–0.8 range, and unrelated text can also score around 0.7. A fixed absolute threshold is therefore
-a poor relevance signal. After sorting search results, prefetch keeps only results whose score is at
-least `top_score * 0.95`, which filters clearly weaker neighbors relative to the best match for that
-query.
+插件内部做了容错归一化：LLM 返回 `completed` / `failed` / 字符串数组等变体都会被映射到正确格式，不会整条丢弃。
 
-### Query gate
+## Requirements
 
-Very short or information-free queries such as greetings, acknowledgements, and phrases like "test
-this" tend to retrieve noise. Returning no prefetched memory is preferable to injecting irrelevant
-context into the prompt, so the plugin skips search when the remaining query has too little semantic
-content.
+- Hermes Agent（需要 `MemoryProvider` 接口）
+- mcp-memory-service ≥ 12.x，启用 `sqlite_vec` 后端
+- `httpx`
+
+服务端的 `commit_session_legacy` 工具会：
+- 存一条 `session-legacy` observation
+- 每条 decision 存成独立 observation
+- 每条 error 转成 mistake note（Pattern / Context / Wrong）
+- 每条 user_correction 存成高优先级 observation
+
+所以 `errors` 和 `user_corrections` 是有长期价值的，别留空。
 
 ## Known limitations
 
-- Recall accuracy is bounded by the embedding model used by mcp-memory-service.
-- Chinese semantic matching is serviceable but generally weaker than matching in languages with more
-  available embeddings for the configured model.
-- In a large memory store, top-k semantic search can miss exact keyword matches. Search results
-  should be treated as context, not authoritative facts.
-
-## Affiliation
-
-This is an independent community project. It is not affiliated with, endorsed by, or maintained by
-Anthropic or Nous Research.
+- `prefetch` 每轮一次跨网络请求。服务在内网/本机时约 50ms，跨公网 300–700ms
+- 相对分数过滤（`score >= top*0.95`）针对 bge-m3 这类有区分度的模型调过。用小维度模型（如 all-MiniLM 384 维）时分数会挤在 0.65–0.8，过滤效果会退化
+- `on_session_end` 同步执行，含 LLM 调用约 5–10 秒。Hermes 在后台线程调用它，不影响对话，但会占一个 worker
+- 不做会话去重。同一 session 重复调用 `commit_session_legacy` 会重复入库
 
 ## License
 
-MIT. See [LICENSE](LICENSE).
+MIT
